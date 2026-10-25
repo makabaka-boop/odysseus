@@ -2869,6 +2869,40 @@ body:not(.doc-find-active) .doc-code-syntax:not(.diff-mode) .doc-editor-textarea
   outline: 2px solid var(--accent, var(--red));
   outline-offset: 3px;
 }
+.doc-email-richbody .richtext-figure-label {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.doc-email-richbody .richtext-figure-ref {
+  display: inline-block;
+  padding: 0 0.35em;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--accent, #2563eb) 12%, transparent);
+  color: var(--accent, #2563eb);
+  border-bottom: 1px solid color-mix(in srgb, var(--accent, #2563eb) 45%, transparent);
+  font-size: 0.92em;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.35;
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+}
+.doc-email-richbody .richtext-figure-ref:hover {
+  background: color-mix(in srgb, var(--accent, #2563eb) 20%, transparent);
+}
+.doc-email-richbody .richtext-figure-ref[data-figure-state="broken"] {
+  background: color-mix(in srgb, #d97706 14%, transparent);
+  color: #b45309;
+  border-bottom-color: color-mix(in srgb, #b45309 55%, transparent);
+  text-decoration: underline wavy color-mix(in srgb, #b45309 70%, transparent);
+  cursor: help;
+}
+.doc-email-richbody figure.richtext-image.is-figure-target {
+  outline: 2px solid var(--accent, var(--red));
+  outline-offset: 4px;
+  border-radius: 6px;
+  transition: outline-color 0.3s ease;
+}
 .doc-rich-image-toolbar {
   position: fixed;
   display: inline-flex;

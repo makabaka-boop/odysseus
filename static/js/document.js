@@ -3554,6 +3554,9 @@ import { attachColorPicker } from './colorPicker.js?v=20260910eyedropper1';
       link.setAttribute('href', safeUrl);
       link.setAttribute('rel', 'noopener noreferrer');
     });
+    // The locate-figure flash is a transient affordance and must not be
+    // persisted into saved HTML / exports.
+    tpl.content.querySelectorAll('.is-figure-target').forEach(el => el.classList.remove('is-figure-target'));
     tpl.content.querySelectorAll('span').forEach(span => {
       if (!_isRichInlineCodeMarker(span)) return;
       const code = document.createElement('code');
@@ -4184,6 +4187,7 @@ import { attachColorPicker } from './colorPicker.js?v=20260910eyedropper1';
       }
       if (_activeRichImage && !_activeRichImage.isConnected) _clearRichImageSelection();
       _normalizeRichTextImages(rich);
+      _reconcileFigureNumbering(rich);
       _normalizeRichChecklists(rich);
       _normalizeRichInlineCode(rich);
       _syncEmailRichbody(rich);
@@ -4363,6 +4367,12 @@ import { attachColorPicker } from './colorPicker.js?v=20260910eyedropper1';
       _uploadMarkdownImages(images);
     });
     rich.addEventListener('pointerdown', (e) => {
+      const figureRef = e.target?.closest?.(`.${_FIGURE_REF_CLASS}`);
+      if (figureRef && rich.contains(figureRef)) {
+        e.preventDefault();
+        _activateFigureReference(rich, figureRef);
+        return;
+      }
       const image = e.target?.closest?.('img.richtext-image, figure.richtext-image img');
       if (image && rich.contains(image)) {
         e.preventDefault();
@@ -4560,6 +4570,7 @@ import { attachColorPicker } from './colorPicker.js?v=20260910eyedropper1';
     rich.setAttribute('aria-label', 'Rich text document');
     rich.innerHTML = _richTextContentToHtml(doc?.content || '');
     _normalizeRichTextImages(rich);
+    _reconcileFigureNumbering(rich);
     _normalizeRichChecklists(rich);
     _normalizeRichInlineCode(rich);
     _wireEmailRichbody(rich);
@@ -5742,7 +5753,302 @@ import { attachColorPicker } from './colorPicker.js?v=20260910eyedropper1';
     _scheduleEmailRichbodySave();
   }
 
+  // --- Automatic figure numbering & figure references ----------------------
+  // Numbered figures carry a stable id (data-figure-id) + data-figure-numbered.
+  // Visible numbers are derived, never authored: every reconciliation pass
+  // numbers enabled figures 1..N in document order and rewrites the caption
+  // labels and the in-body reference chips. References bind to the stable id,
+  // so deleting/renumbering a figure can never silently retarget a reference —
+  // orphaned chips switch to a "broken" state.
+  const _FIGURE_NUMBERED_ATTR = 'data-figure-numbered';
+  const _FIGURE_ID_ATTR = 'data-figure-id';
+  const _FIGURE_REF_ATTR = 'data-figure-ref';
+  const _FIGURE_REF_CLASS = 'richtext-figure-ref';
+
+  function _newFigureId() {
+    return `fig-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
+  }
+  const _figureLabelText = number => `Figure ${number}`;
+  const _figureBrokenRefText = () => 'Figure ?';
+
+  function _ensureFigureCaption(figure) {
+    let caption = figure.querySelector(':scope > .richtext-image-caption');
+    const legacy = caption ? null : figure.querySelector(':scope > figcaption');
+    if (!caption) {
+      caption = document.createElement('div');
+      caption.className = 'richtext-image-caption';
+      if (legacy) {
+        caption.innerHTML = legacy.innerHTML;
+        legacy.replaceWith(caption);
+      } else {
+        figure.appendChild(caption);
+      }
+    }
+    caption.classList.add('richtext-image-caption');
+    caption.setAttribute('role', 'note');
+    caption.setAttribute('aria-label', 'Image caption');
+    caption.setAttribute('contenteditable', 'false');
+    return caption;
+  }
+
+  // The author-entered caption text, excluding the generated "Figure n" label
+  // and the ": " separator. Accepts either the figure or its caption element.
+  function _figureCaptionUserText(figureOrCaption) {
+    if (!figureOrCaption) return '';
+    const caption = figureOrCaption.classList?.contains('richtext-image-caption')
+      ? figureOrCaption
+      : figureOrCaption.querySelector?.(':scope > .richtext-image-caption, :scope > figcaption');
+    if (!caption) return '';
+    const textSpan = caption.querySelector(':scope > .richtext-figure-caption-text');
+    if (textSpan) return (textSpan.textContent || '').replace(/^\s*:\s*/, '').trim();
+    return (caption.textContent || '')
+      .replace(/^\s*Figure\s+\d+\s*:?[\s\u00a0]*/i, '')
+      .trim();
+  }
+
+  // Idempotently render `Figure n: caption` inside a numbered figure's caption.
+  function _renderNumberedFigureCaption(figure, number) {
+    const caption = _ensureFigureCaption(figure);
+    const text = _figureCaptionUserText(caption);
+    let label = caption.querySelector(':scope > .richtext-figure-label');
+    let textSpan = caption.querySelector(':scope > .richtext-figure-caption-text');
+    const nodes = Array.from(caption.childNodes);
+    const wellFormed = label && textSpan && nodes.length === 2 && nodes[0] === label && nodes[1] === textSpan;
+    if (!wellFormed) {
+      caption.replaceChildren();
+      label = document.createElement('span');
+      label.className = 'richtext-figure-label';
+      textSpan = document.createElement('span');
+      textSpan.className = 'richtext-figure-caption-text';
+      caption.append(label, textSpan);
+    }
+    label.setAttribute('contenteditable', 'false');
+    const expectedLabel = _figureLabelText(number);
+    if (label.textContent !== expectedLabel) label.textContent = expectedLabel;
+    const expectedText = text ? `: ${text}` : '';
+    if (textSpan.textContent !== expectedText) textSpan.textContent = expectedText;
+  }
+
+  // Strip a generated label, restoring the plain-text caption used by
+  // unnumbered images.
+  function _renderPlainFigureCaption(figure) {
+    const caption = figure.querySelector(':scope > .richtext-image-caption');
+    if (!caption || !caption.querySelector('.richtext-figure-label')) return;
+    const text = _figureCaptionUserText(caption);
+    if (text) {
+      caption.replaceChildren();
+      caption.textContent = text;
+    } else {
+      caption.remove();
+    }
+  }
+
+  // Numbered figures in document order: [{ figure, id, number, caption }].
+  // Figures missing an id are skipped here; _reconcileFigureNumbering mints
+  // the id first.
+  function _orderedNumberedFigures(root) {
+    if (!root) return [];
+    const seen = new Set();
+    const list = [];
+    root.querySelectorAll('figure.richtext-image').forEach(figure => {
+      if (figure.getAttribute(_FIGURE_NUMBERED_ATTR) !== 'true' || !figure.querySelector(':scope > img, :scope > picture img')) return;
+      const id = figure.getAttribute(_FIGURE_ID_ATTR);
+      if (!id || seen.has(id)) return;
+      seen.add(id);
+      list.push({
+        figure,
+        id,
+        number: list.length + 1,
+        caption: _figureCaptionUserText(figure),
+      });
+    });
+    return list;
+  }
+
+  function _updateFigureRefChip(ref, number) {
+    if (number) {
+      const expected = _figureLabelText(number);
+      if (ref.textContent !== expected) ref.textContent = expected;
+      if (ref.dataset.figureState !== 'ok') ref.dataset.figureState = 'ok';
+      ref.setAttribute('title', `Jump to ${expected}`);
+      ref.setAttribute('aria-label', expected);
+      ref.setAttribute('role', 'link');
+      ref.removeAttribute('aria-disabled');
+    } else {
+      const expected = _figureBrokenRefText();
+      if (ref.textContent !== expected) ref.textContent = expected;
+      if (ref.dataset.figureState !== 'broken') ref.dataset.figureState = 'broken';
+      ref.setAttribute('title', 'Referenced image was deleted or had numbering turned off');
+      ref.setAttribute('aria-label', 'Broken figure reference');
+      ref.setAttribute('aria-disabled', 'true');
+      ref.removeAttribute('role');
+    }
+  }
+
+  // Re-derive every figure number and every reference from the current DOM.
+  // Safe to run after any edit (typing, paste, delete, undo/redo): it only
+  // touches generated label/chip nodes and leaves unnumbered figures alone.
+  function _reconcileFigureNumbering(root) {
+    if (!root) return;
+    const figures = Array.from(root.querySelectorAll('figure.richtext-image'));
+    const refs = Array.from(root.querySelectorAll(`.${_FIGURE_REF_CLASS}`));
+    const hasLabeledCaption = figures.some(figure =>
+      figure.querySelector(':scope > .richtext-image-caption .richtext-figure-label, :scope > figcaption .richtext-figure-label'));
+    const numberedCount = figures.filter(figure =>
+      figure.getAttribute(_FIGURE_NUMBERED_ATTR) === 'true' && figure.querySelector('img')).length;
+    if (!numberedCount && !refs.length && !hasLabeledCaption) return;
+
+    // Assign stable ids (minting for copies/legacy content) and sequential
+    // numbers in document order.
+    const seen = new Set();
+    const numberById = new Map();
+    let serial = 0;
+    figures.forEach(figure => {
+      if (figure.getAttribute(_FIGURE_NUMBERED_ATTR) !== 'true' || !figure.querySelector('img')) return;
+      let id = figure.getAttribute(_FIGURE_ID_ATTR);
+      if (!id || seen.has(id)) {
+        id = _newFigureId();
+        figure.setAttribute(_FIGURE_ID_ATTR, id);
+      }
+      seen.add(id);
+      numberById.set(id, ++serial);
+    });
+
+    figures.forEach(figure => {
+      const id = figure.getAttribute(_FIGURE_ID_ATTR);
+      const number = id ? numberById.get(id) : null;
+      if (number) _renderNumberedFigureCaption(figure, number);
+      else _renderPlainFigureCaption(figure);
+    });
+
+    refs.forEach(ref => {
+      const id = ref.getAttribute(_FIGURE_REF_ATTR);
+      _updateFigureRefChip(ref, id ? numberById.get(id) : null);
+    });
+  }
+
+  function _toggleRichFigureNumbering(rich, image) {
+    if (!image) return null;
+    const currentFigure = image.closest('figure.richtext-image');
+    const enabled = currentFigure?.getAttribute(_FIGURE_NUMBERED_ATTR) === 'true';
+    const wasBare = !currentFigure;
+    // Build the replacement up front so the whole toggle is one native
+    // insertHTML command (one Ctrl+Z step), mirroring caption editing.
+    let replacement;
+    if (currentFigure) {
+      replacement = currentFigure.cloneNode(true);
+      replacement.querySelectorAll('[data-editor-image-selected]').forEach(el => {
+        el.removeAttribute('data-editor-image-selected');
+      });
+    } else {
+      replacement = document.createElement('figure');
+      replacement.className = 'richtext-image';
+      const imageClone = image.cloneNode(true);
+      imageClone.removeAttribute('data-editor-image-selected');
+      replacement.appendChild(imageClone);
+    }
+    if (enabled) {
+      // Turning numbering off retires the identity: existing references must
+      // go stale rather than follow whatever image later takes the number.
+      replacement.removeAttribute(_FIGURE_NUMBERED_ATTR);
+      replacement.removeAttribute(_FIGURE_ID_ATTR);
+      _renderPlainFigureCaption(replacement);
+      // A bare image that only gained a wrapper for its number goes back to
+      // being a bare image.
+      if (wasBare && !replacement.querySelector(':scope > .richtext-image-caption')) {
+        replacement = replacement.querySelector('img') || replacement;
+      }
+    } else {
+      replacement.setAttribute(_FIGURE_NUMBERED_ATTR, 'true');
+      replacement.setAttribute(_FIGURE_ID_ATTR, _newFigureId());
+      // Provisional number; reconciliation re-numbers in document order.
+      _renderNumberedFigureCaption(replacement, 1);
+    }
+    const inserted = _replaceRichImageFigure(rich, image, replacement);
+    _reconcileFigureNumbering(rich);
+    return inserted;
+  }
+
+  function _buildFigureRefElement(id, number) {
+    const ref = document.createElement('span');
+    ref.className = _FIGURE_REF_CLASS;
+    ref.setAttribute('contenteditable', 'false');
+    ref.setAttribute(_FIGURE_REF_ATTR, id);
+    ref.dataset.figureState = 'ok';
+    ref.textContent = _figureLabelText(number);
+    return ref;
+  }
+
+  // Insert a reference chip at the current caret as one native edit (undoable
+  // in a single Ctrl+Z).
+  function _insertFigureReference(rich, id) {
+    if (!rich || !id) return false;
+    const entry = _orderedNumberedFigures(rich).find(item => item.id === id);
+    if (!entry) {
+      uiModule?.showToast?.('That image has numbering turned off');
+      return false;
+    }
+    const selection = window.getSelection();
+    const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+    if (!range || !rich.contains(range.commonAncestorContainer)) {
+      uiModule?.showToast?.('Place the cursor in the text first');
+      return false;
+    }
+    rich.focus();
+    const token = `doc-figref-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const ref = _buildFigureRefElement(entry.id, entry.number);
+    ref.dataset.editorFigrefToken = token;
+    if (!document.execCommand('insertHTML', false, ref.outerHTML)) return false;
+    const inserted = rich.querySelector(`[data-editor-figref-token="${token}"]`);
+    if (!inserted) return false;
+    inserted.removeAttribute('data-editor-figref-token');
+    const after = document.createRange();
+    after.setStartAfter(inserted);
+    after.collapse(true);
+    selection.removeAllRanges();
+    selection.addRange(after);
+    return true;
+  }
+
+  function _activateFigureReference(rich, ref) {
+    const id = ref.getAttribute(_FIGURE_REF_ATTR);
+    const target = id
+      ? Array.from(rich.querySelectorAll('figure.richtext-image')).find(figure =>
+        figure.getAttribute(_FIGURE_ID_ATTR) === id
+        && figure.getAttribute(_FIGURE_NUMBERED_ATTR) === 'true'
+        && figure.querySelector('img'))
+      : null;
+    if (!target) {
+      uiModule?.showToast?.('The referenced image is unavailable');
+      return;
+    }
+    target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    target.classList.add('is-figure-target');
+    setTimeout(() => target.classList.remove('is-figure-target'), 1600);
+    rich.focus({ preventScroll: true });
+  }
+
+  // Chromium leaves an empty <figure> shell behind when execCommand
+  // ('insertHTML' / 'delete') operates on a range that selects the whole
+  // figure NODE: it empties the wrapper and inserts the replacement as a
+  // sibling. Our own edit primitives (_execRichFigureCommand) avoid that by
+  // anchoring the range inside neighbouring blocks, so shells only appear in
+  // legacy/pasted content — strip those. Do not rely on this for undo: native
+  // undo restores removed contents into the (now detached) shell, so it is
+  // only safe for content that was never part of an active edit.
+  function _stripEmptyFigureShells(root) {
+    if (!root) return;
+    root.querySelectorAll('figure.richtext-image').forEach(figure => {
+      if (figure.querySelector('img, picture, video, canvas, iframe, svg')) return;
+      const caption = figure.querySelector(':scope > .richtext-image-caption, :scope > figcaption');
+      if (caption && (caption.textContent || '').trim()) return;
+      if ((figure.textContent || '').trim()) return;
+      figure.remove();
+    });
+  }
+
   function _normalizeRichTextImages(root) {
+    _stripEmptyFigureShells(root);
     root.querySelectorAll('figure.richtext-image').forEach(figure => {
       const image = figure.querySelector('img');
       if (!image) return;
@@ -5859,6 +6165,77 @@ import { attachColorPicker } from './colorPicker.js?v=20260910eyedropper1';
     return inserted;
   }
 
+  function _firstEditableTextIn(el) {
+    for (const node of el.childNodes) {
+      if (node.nodeType === Node.TEXT_NODE) {
+        if (node.nodeValue) return node;
+      } else if (node.nodeType === Node.ELEMENT_NODE) {
+        if (node.getAttribute?.('contenteditable') === 'false') continue;
+        const found = _firstEditableTextIn(node);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
+  function _lastEditableTextIn(el) {
+    for (let i = el.childNodes.length - 1; i >= 0; i--) {
+      const node = el.childNodes[i];
+      if (node.nodeType === Node.TEXT_NODE) {
+        if (node.nodeValue) return node;
+      } else if (node.nodeType === Node.ELEMENT_NODE) {
+        if (node.getAttribute?.('contenteditable') === 'false') continue;
+        const found = _lastEditableTextIn(node);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
+  // Replace (html) or delete (html === '') a figure block as a single native
+  // edit, so execCommand undo/redo restores the exact node in place.
+  // Key Chromium behaviour: a range that SELECTS the figure node makes
+  // execCommand empty the figure into a leftover shell and insert the result
+  // as a sibling (undo then restores into the detached shell). Anchoring the
+  // range at text positions inside the neighbouring blocks makes the browser
+  // remove the node itself. A host-boundary range START (figure is the first
+  // block with a following sibling) misfires, so that rare layout falls back
+  // to an exact (but not native-undo-tracked) Range-API edit.
+  function _execRichFigureCommand(rich, figure, html) {
+    rich.focus({ preventScroll: true });
+    const selection = window.getSelection();
+    const prev = figure.previousElementSibling;
+    const next = figure.nextElementSibling;
+    if (!prev && next) {
+      const range = document.createRange();
+      range.selectNode(figure);
+      range.deleteContents();
+      if (html) {
+        const template = document.createElement('template');
+        template.innerHTML = html;
+        range.insertNode(template.content);
+      }
+      rich.dispatchEvent(new Event('input', { bubbles: true }));
+      return true;
+    }
+    const range = document.createRange();
+    if (!prev && !next) {
+      range.setStart(rich, 0);
+      range.setEnd(rich, rich.childNodes.length);
+    } else {
+      const startText = _lastEditableTextIn(prev);
+      if (startText) range.setStart(startText, startText.nodeValue.length);
+      else range.setStart(prev, prev.childNodes.length);
+      const endText = next ? _firstEditableTextIn(next) : null;
+      if (endText) range.setEnd(endText, 0);
+      else if (next) range.setEnd(next, 0);
+      else range.setEnd(rich, rich.childNodes.length);
+    }
+    selection.removeAllRanges();
+    selection.addRange(range);
+    return document.execCommand('insertHTML', false, html);
+  }
+
   function _replaceRichImageFigure(rich, image, replacement) {
     const original = image.closest('figure.richtext-image') || image;
     const token = `doc-image-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -5867,12 +6244,7 @@ import { attachColorPicker } from './colorPicker.js?v=20260910eyedropper1';
     replacement.querySelectorAll?.('[data-editor-image-selected]').forEach(item => {
       item.removeAttribute('data-editor-image-selected');
     });
-    const range = document.createRange();
-    range.selectNode(original);
-    const selection = window.getSelection();
-    selection.removeAllRanges();
-    selection.addRange(range);
-    if (!document.execCommand('insertHTML', false, replacement.outerHTML)) return null;
+    _execRichFigureCommand(rich, original, replacement.outerHTML);
     const inserted = rich.querySelector(`[data-editor-image-token="${token}"]`);
     if (!inserted) return null;
     inserted.removeAttribute('data-editor-image-token');
@@ -5882,12 +6254,20 @@ import { attachColorPicker } from './colorPicker.js?v=20260910eyedropper1';
   }
 
   function _deleteRichImage(rich, image) {
-    const range = document.createRange();
-    range.selectNode(image);
-    const selection = window.getSelection();
-    selection.removeAllRanges();
-    selection.addRange(range);
-    document.execCommand('delete');
+    // Delete the whole figure (image + caption) as one native edit so undo
+    // restores both. The anchored range removes the node itself; selecting
+    // only the <img> (or the figure node) would leave an orphan shell.
+    const target = image.closest('figure.richtext-image');
+    if (target) {
+      _execRichFigureCommand(rich, target, '');
+    } else {
+      const range = document.createRange();
+      range.selectNode(image);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      document.execCommand('delete');
+    }
     _clearRichImageSelection();
     rich.focus();
   }
@@ -7562,6 +7942,7 @@ import { attachColorPicker } from './colorPicker.js?v=20260910eyedropper1';
           <button type="button" id="md-toolbar-inline-image-btn" class="md-toolbar-inline-image-btn md-toolbar-edit-only" title="Insert image" aria-label="Insert image" style="display:none"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/><line x1="18" y1="4" x2="18" y2="10"/><line x1="15" y1="7" x2="21" y2="7"/></svg></button>
           <button type="button" class="md-toolbar-edit-only" data-md="link" title="Link (Ctrl+K)"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg></button>
           <button type="button" class="md-dd-toggle md-toolbar-rich-only" data-dd="image" title="Image options" style="display:none"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg><svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg></button>
+          <button type="button" class="md-dd-toggle md-toolbar-rich-only" data-dd="figureref" title="Insert figure reference" aria-label="Insert figure reference" style="display:none"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="9" y1="4" x2="6" y2="20"/><line x1="18" y1="4" x2="15" y2="20"/><line x1="4" y1="9" x2="20" y2="9"/><line x1="3" y1="15" x2="19" y2="15"/></svg><svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg></button>
           <button type="button" class="md-dd-toggle md-toolbar-email-hide md-toolbar-edit-only" data-dd="code" title="Code">\`<svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg></button>
           <span class="md-toolbar-sep md-toolbar-rich-only" style="display:none"></span>
           <button type="button" class="md-dd-toggle md-toolbar-rich-only" data-dd="textsize" title="Font size" aria-label="Font size" style="display:none"><span class="rich-font-size-icon">16</span><svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg></button>
@@ -9498,13 +9879,17 @@ import { attachColorPicker } from './colorPicker.js?v=20260910eyedropper1';
     }
     const existingFigure = image.closest('figure.richtext-image');
     const existingCaption = existingFigure?.querySelector(':scope > .richtext-image-caption, :scope > figcaption');
-    const caption = await _promptImageCaption(existingCaption?.textContent || '');
+    // The prompt edits only the author text; "Figure n" is generated and must
+    // not be offered for editing.
+    const caption = await _promptImageCaption(_figureCaptionUserText(existingFigure || existingCaption));
     if (caption === null || !image.isConnected) return;
 
     const replacementImage = image.cloneNode(true);
     replacementImage.removeAttribute('data-editor-image-selected');
+    const numbered = existingFigure?.getAttribute(_FIGURE_NUMBERED_ATTR) === 'true'
+      && existingFigure?.getAttribute(_FIGURE_ID_ATTR);
     let replacement = replacementImage;
-    if (caption) {
+    if (caption || numbered) {
       const figure = existingFigure?.cloneNode(true) || document.createElement('figure');
       figure.classList.add('richtext-image');
       const clonedImage = figure.querySelector('img');
@@ -9522,10 +9907,25 @@ import { attachColorPicker } from './colorPicker.js?v=20260910eyedropper1';
         captionElement = stableCaption;
       }
       captionElement.setAttribute('contenteditable', 'false');
-      captionElement.textContent = caption;
+      if (numbered) {
+        // Numbering attributes survived the clone. Put the edited text in a
+        // caption-text span, then render through the canonical path so the
+        // generated label is (re)built correctly.
+        const currentNumber = _orderedNumberedFigures(rich)
+          .find(entry => entry.id === figure.getAttribute(_FIGURE_ID_ATTR))?.number || 1;
+        captionElement.replaceChildren();
+        const textSpan = document.createElement('span');
+        textSpan.className = 'richtext-figure-caption-text';
+        textSpan.textContent = caption ? `: ${caption}` : '';
+        captionElement.appendChild(textSpan);
+        _renderNumberedFigureCaption(figure, currentNumber);
+      } else {
+        captionElement.textContent = caption;
+      }
       replacement = figure;
     }
     _replaceRichImageFigure(rich, image, replacement);
+    _reconcileFigureNumbering(rich);
     _syncEmailRichbody(rich);
     _scheduleEmailRichbodySave();
   }
@@ -9542,7 +9942,13 @@ import { attachColorPicker } from './colorPicker.js?v=20260910eyedropper1';
       _scheduleEmailRichbodySave();
       return true;
     }
-
+    if (action === 'image:number') {
+      _toggleRichFigureNumbering(rich, image);
+      _reconcileFigureNumbering(rich);
+      _syncEmailRichbody(rich);
+      _scheduleEmailRichbodySave();
+      return true;
+    }
     const clone = image.cloneNode(true);
     if (action.startsWith('image:size:')) {
       Array.from(clone.classList).forEach(name => {
@@ -10081,6 +10487,17 @@ import { attachColorPicker } from './colorPicker.js?v=20260910eyedropper1';
       }
       if (action === 'image:alt') { _editRichImageAlt(_rich); return; }
       if (action === 'image:caption') { _editRichImageCaption(_rich); return; }
+      if (action === 'figureref:empty') return;
+      if (action.startsWith('figureref:insert:')) {
+        const inserted = _insertFigureReference(_rich, action.slice('figureref:insert:'.length));
+        if (inserted) {
+          _reconcileFigureNumbering(_rich);
+          _syncEmailRichbody(_rich);
+          _scheduleEmailRichbodySave();
+          _scheduleDocumentHistoryControls();
+        }
+        return;
+      }
       const _cmd = {
         bold: 'bold', italic: 'italic', underline: 'underline', strike: 'strikeThrough',
         superscript: 'superscript', subscript: 'subscript',
@@ -10683,6 +11100,9 @@ import { attachColorPicker } from './colorPicker.js?v=20260910eyedropper1';
         const alignClass = Array.from(selectedImage.classList).find(name => name.startsWith('richtext-image-align-'));
         current.add(sizeClass ? `image:size:${sizeClass.slice('richtext-image-size-'.length)}` : 'image:size:auto');
         current.add(`image:align:${alignClass ? alignClass.slice('richtext-image-align-'.length) : 'left'}`);
+        if (selectedImage.closest('figure.richtext-image')?.getAttribute(_FIGURE_NUMBERED_ATTR) === 'true') {
+          current.add('image:number');
+        }
       } else if (kind === 'table' && selectedCell) {
         const table = selectedCell.closest('table');
         const cellAlignment = selectedCell.style.verticalAlign || 'top';
@@ -10787,6 +11207,7 @@ import { attachColorPicker } from './colorPicker.js?v=20260910eyedropper1';
         ['image:align:left', 'Align left', '←'],
         ['image:align:center', 'Align center', '↔'],
         ['image:align:right', 'Align right', '→'],
+        ['image:number', 'Auto-number caption', '№'],
         ['image:caption', 'Edit caption', 'T'],
         ['image:alt', 'Edit description', 'Aa'],
         ['image:delete', 'Remove image', '×'],
@@ -10804,6 +11225,20 @@ import { attachColorPicker } from './colorPicker.js?v=20260910eyedropper1';
     const activeDoc = activeDocId && docs.get(activeDocId);
     if (kind === 'list' && activeDoc?.language === 'email') {
       items = items?.filter(([action]) => action !== 'check');
+    }
+    if (kind === 'figureref') {
+      // Dynamic menu: every numbered figure in document order, showing the
+      // current figure number and caption. The inserted chip binds to the
+      // stable id, not the displayed number.
+      const figuresRoot = _emailRichbodyActive();
+      if (figuresRoot) _reconcileFigureNumbering(figuresRoot);
+      const entries = figuresRoot ? _orderedNumberedFigures(figuresRoot) : [];
+      items = entries.length
+        ? entries.map(entry => {
+            const snippet = (entry.caption || 'No caption').replace(/\s+/g, ' ').slice(0, 80);
+            return [`figureref:insert:${entry.id}`, `${_figureLabelText(entry.number)} — ${snippet}`, String(entry.number)];
+          })
+        : [['figureref:empty', 'No numbered images yet', '']];
     }
     if (!items) return;
 
@@ -10876,7 +11311,7 @@ import { attachColorPicker } from './colorPicker.js?v=20260910eyedropper1';
         (md === 'table:merge-right' && !_richTableCanMergeRight(selectedCell))
         || (md === 'table:split-cell' && !_richTableCanSplitCell(selectedCell))
       );
-      if ((needsTableSelection && (!selectedCell || unavailableTableAction)) || (needsImageSelection && !selectedImage)) {
+      if ((needsTableSelection && (!selectedCell || unavailableTableAction)) || (needsImageSelection && !selectedImage) || md === 'figureref:empty') {
         it.disabled = true;
         it.setAttribute('aria-disabled', 'true');
       }
@@ -15330,6 +15765,9 @@ import { attachColorPicker } from './colorPicker.js?v=20260910eyedropper1';
       'figure.richtext-image:has(img.richtext-image-align-left) .richtext-image-caption{margin-left:0;margin-right:auto}',
       'figure.richtext-image:has(img.richtext-image-align-center) .richtext-image-caption{margin-left:auto;margin-right:auto}',
       'figure.richtext-image:has(img.richtext-image-align-right) .richtext-image-caption{margin-left:auto;margin-right:0}',
+      '.richtext-figure-label{font-weight:600;font-variant-numeric:tabular-nums}',
+      '.richtext-figure-ref{display:inline-block;padding:0 .35em;border-radius:4px;background:#e8f0fe;color:#1d4ed8;border-bottom:1px solid #9db9f2;white-space:nowrap;font-variant-numeric:tabular-nums}',
+      '.richtext-figure-ref[data-figure-state="broken"]{background:#fdf0e2;color:#b45309;border-bottom-color:#d6a26a;text-decoration:underline wavy #b45309}',
       'img.richtext-image-size-100{width:100%}',
       'img.richtext-image-size-60{width:60%}',
       'img.richtext-image-size-35{width:35%}',
@@ -15944,8 +16382,17 @@ import { attachColorPicker } from './colorPicker.js?v=20260910eyedropper1';
       .replace(/^\s*<!--\s*(?:pdf|pdf_form|docx)_source\s+upload_id="[^"]+"\s*-->\s*/i, '')
       .replace(/^\s*<!--\s*docx_source\s+upload_id="[^"]+"\s*-->\s*/i, '');
     const lang = document.getElementById('doc-language-select')?.value || '';
+    if (_isRichTextLang(lang)) {
+      // Make sure the mirrored HTML about to be converted carries the current
+      // figure numbers, captions, and reference texts.
+      const liveRich = _emailRichbodyActive();
+      if (liveRich) {
+        _reconcileFigureNumbering(liveRich);
+        _syncEmailRichbody(liveRich);
+      }
+    }
     const children = _isRichTextLang(lang)
-      ? await _richTextToDocxChildren(text, window.docx)
+      ? await _richTextToDocxChildren(textarea.value || text, window.docx)
       : _markdownToDocxChildren(text, window.docx);
     const doc = new window.docx.Document({
       numbering: _richDocxNumbering(window.docx),
